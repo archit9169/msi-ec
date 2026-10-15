@@ -1,0 +1,110 @@
+name: Build MSI-EC for ZimaOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: Kernel.org source version (target release is checked against the input bundle)
+        required: true
+        default: '6.18.9'
+        type: string
+      target_bundle_url:
+        description: HTTPS download URL of the target-inputs tar.gz from your ZimaOS host
+        required: true
+        type: string
+      target_bundle_sha256:
+        description: SHA256 of that target-inputs tar.gz
+        required: true
+        type: string
+      publish_release:
+        description: Publish a uniquely tagged prerelease after all build checks pass
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msi-ec-zimaos-${{ github.ref }}-${{ inputs.kernel_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ubuntu:24.04
+      options: --cpus 2 --memory 4g
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential gcc-14 g++-14 kmod curl xz-utils \
+            bc bison flex libssl-dev libelf-dev python3 binutils
+      - name: Check out this fork at the selected commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate build helper
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+      - name: Prepare target kernel, build and validate MSI-EC
+        env:
+          TARGET_KERNEL_VERSION: ${{ inputs.kernel_version }}
+          TARGET_BUNDLE_URL: ${{ inputs.target_bundle_url }}
+          TARGET_BUNDLE_SHA256: ${{ inputs.target_bundle_sha256 }}
+          CC: gcc-14
+          HOSTCC: gcc-14
+        run: python3 scripts/ci/build_zimaos.py
+      - name: Retain logs even when validation fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zimaos-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-zimaos/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload validated release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zimaos-module-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist-zimaos/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: ${{ inputs.publish_release }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zimaos-module-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-files
+      - name: Publish without replacing an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-files
+          sha256sum --check SHA256SUMS
+          kernel=$(python3 -c 'import json; print(json.load(open("build.json"))["kernel_release"])')
+          tag="msi-ec-${kernel}-run-${RUN_ID}-${RUN_ATTEMPT}"
+          gh release create "$tag" ./* \
+            --target "$SOURCE_COMMIT" \
+            --title "MSI-EC for ${kernel} (x86_64)" \
+            --notes-file RELEASE-NOTES.txt --prerelease --latest=false
